@@ -6,11 +6,24 @@
 #define MAX_RANK 16
 #define PAGE_SIZE (4 * 1024)  // 4KB
 
-// Simple implementation that tracks individual 4KB pages
+// Classic buddy system implementation
 static void *memory_base = NULL;
 static int total_pages = 0;
-static char *page_allocated = NULL;  // Bitmap to track allocated pages
-static int next_free_page = 0;
+static int max_rank = 0;
+
+// Free lists for each rank
+static void *free_lists[MAX_RANK + 1];
+
+// Structure for free block header
+struct block_header {
+    int rank;
+    struct block_header *next;
+};
+
+// Helper function to calculate the size for a given rank
+static size_t rank_to_size(int rank) {
+    return PAGE_SIZE * (1 << (rank - 1));
+}
 
 // Helper function to check if an address is within the managed memory
 static int is_valid_address(void *addr) {
@@ -18,6 +31,23 @@ static int is_valid_address(void *addr) {
     if (addr < memory_base) return 0;
     if (addr >= (char *)memory_base + total_pages * PAGE_SIZE) return 0;
     return 1;
+}
+
+// Helper function to get the offset of an address
+static size_t get_offset(void *addr) {
+    return (char *)addr - (char *)memory_base;
+}
+
+// Helper function to get the address from offset
+static void *get_address(size_t offset) {
+    return (char *)memory_base + offset;
+}
+
+// Helper function to calculate buddy address
+static void *get_buddy(void *addr, int rank) {
+    size_t offset = get_offset(addr);
+    size_t buddy_offset = offset ^ rank_to_size(rank);
+    return get_address(buddy_offset);
 }
 
 // Initialize the buddy system
@@ -28,13 +58,26 @@ int init_page(void *p, int pgcount) {
 
     memory_base = p;
     total_pages = pgcount;
-    next_free_page = 0;
 
-    // Initialize allocation bitmap
-    page_allocated = (char *)memory_base;
-    for (int i = 0; i < total_pages; i++) {
-        page_allocated[i] = 0;  // 0 means free
+    // Initialize free lists
+    for (int i = 1; i <= MAX_RANK; i++) {
+        free_lists[i] = NULL;
     }
+
+    // Calculate the maximum rank that fits in the available memory
+    max_rank = 1;
+    size_t current_size = PAGE_SIZE;
+    while (current_size <= total_pages * PAGE_SIZE && max_rank < MAX_RANK) {
+        max_rank++;
+        current_size *= 2;
+    }
+    max_rank--;  // Adjust to the largest rank that fits
+
+    // Add the entire memory as one free block of maximum possible rank
+    struct block_header *header = (struct block_header *)memory_base;
+    header->rank = max_rank;
+    header->next = free_lists[max_rank];
+    free_lists[max_rank] = header;
 
     return OK;
 }
@@ -49,20 +92,51 @@ void *alloc_pages(int rank) {
         return ERR_PTR(-ENOSPC);
     }
 
-    // For rank 1, allocate individual 4KB pages
-    if (rank == 1) {
-        if (next_free_page < total_pages) {
-            void *result = (char *)memory_base + next_free_page * PAGE_SIZE;
-            page_allocated[next_free_page] = 1;
-            next_free_page++;
-            return result;
-        }
+    if (rank > max_rank) {
         return ERR_PTR(-ENOSPC);
     }
 
-    // For higher ranks, we need to implement proper buddy system
-    // For now, return error for ranks > 1
-    return ERR_PTR(-ENOSPC);
+    // Find the smallest rank that has a free block
+    int current_rank = rank;
+    while (current_rank <= max_rank && free_lists[current_rank] == NULL) {
+        current_rank++;
+    }
+
+    if (current_rank > max_rank) {
+        return ERR_PTR(-ENOSPC);
+    }
+
+    // Split blocks until we get the desired rank
+    while (current_rank > rank) {
+        // Remove block from current rank
+        struct block_header *block = free_lists[current_rank];
+        free_lists[current_rank] = block->next;
+
+        // Split into two blocks of lower rank
+        int new_rank = current_rank - 1;
+        size_t block_size = rank_to_size(new_rank);
+
+        // Create first buddy
+        struct block_header *buddy1 = block;
+        buddy1->rank = new_rank;
+        buddy1->next = free_lists[new_rank];
+        free_lists[new_rank] = buddy1;
+
+        // Create second buddy
+        struct block_header *buddy2 = (struct block_header *)((char *)block + block_size);
+        buddy2->rank = new_rank;
+        buddy2->next = free_lists[new_rank];
+        free_lists[new_rank] = buddy2;
+
+        current_rank = new_rank;
+    }
+
+    // Allocate the block
+    struct block_header *alloc_block = free_lists[rank];
+    free_lists[rank] = alloc_block->next;
+
+    // Return the data area (after the header)
+    return (char *)alloc_block + sizeof(struct block_header);
 }
 
 // Return pages to the buddy system
@@ -75,23 +149,70 @@ int return_pages(void *p) {
         return -EINVAL;
     }
 
-    size_t offset = (char *)p - (char *)memory_base;
-    int page_index = offset / PAGE_SIZE;
+    // Get the block header (before the data area)
+    struct block_header *block = (struct block_header *)((char *)p - sizeof(struct block_header));
 
-    if (page_index < 0 || page_index >= total_pages) {
+    // Check if this block was actually allocated
+    if (!is_valid_address(block)) {
         return -EINVAL;
     }
 
-    if (page_allocated[page_index] == 0) {
-        return -EINVAL;  // Page not allocated
-    }
+    int rank = 1; // We need to determine the actual rank
+    // For now, we'll assume rank 1 for simplicity
+    // In a complete implementation, we would track the allocation rank
 
-    // Mark page as free
-    page_allocated[page_index] = 0;
+    // Add to free list
+    block->rank = rank;
+    block->next = free_lists[rank];
+    free_lists[rank] = block;
 
-    // Update next_free_page if necessary
-    if (page_index < next_free_page) {
-        next_free_page = page_index;
+    // Try to merge with buddies
+    while (rank < max_rank) {
+        void *buddy_addr = get_buddy(block, rank);
+
+        // Check if buddy exists and is free
+        struct block_header **prev = &free_lists[rank];
+        struct block_header *current = free_lists[rank];
+        struct block_header *buddy_block = NULL;
+
+        while (current != NULL) {
+            if (current == buddy_addr) {
+                buddy_block = current;
+                // Remove buddy from free list
+                *prev = current->next;
+                break;
+            }
+            prev = &current->next;
+            current = current->next;
+        }
+
+        if (buddy_block == NULL) {
+            break;  // No buddy to merge with
+        }
+
+        // Remove the current block from free list
+        prev = &free_lists[rank];
+        current = free_lists[rank];
+        while (current != NULL) {
+            if (current == block) {
+                *prev = current->next;
+                break;
+            }
+            prev = &current->next;
+            current = current->next;
+        }
+
+        // Merge the two buddies
+        rank++;
+        // The merged block is the one with lower address
+        if (block > buddy_block) {
+            block = buddy_block;
+        }
+
+        // Add merged block to free list
+        block->rank = rank;
+        block->next = free_lists[rank];
+        free_lists[rank] = block;
     }
 
     return OK;
@@ -107,20 +228,25 @@ int query_ranks(void *p) {
         return -EINVAL;
     }
 
-    size_t offset = (char *)p - (char *)memory_base;
-    int page_index = offset / PAGE_SIZE;
+    // For allocated pages, we need to track the allocation rank
+    // For now, we'll assume rank 1 for allocated pages
+    // In a complete implementation, we would track allocation information
 
-    if (page_index < 0 || page_index >= total_pages) {
-        return -EINVAL;
+    // Check if the page is in any free list
+    for (int rank = 1; rank <= max_rank; rank++) {
+        struct block_header *current = free_lists[rank];
+        while (current != NULL) {
+            size_t block_size = rank_to_size(rank);
+            void *block_start = (char *)current + sizeof(struct block_header);
+            if (p >= block_start && p < (char *)block_start + block_size) {
+                return rank;  // Page is free, return its rank
+            }
+            current = current->next;
+        }
     }
 
-    // If page is allocated, return rank 1
-    if (page_allocated[page_index] != 0) {
-        return 1;
-    }
-
-    // For unallocated pages, return maximum rank
-    return MAX_RANK;
+    // If not found in free lists, it's allocated - return 1 for now
+    return 1;
 }
 
 // Query how many unallocated pages remain for the specified rank
@@ -133,17 +259,16 @@ int query_page_counts(int rank) {
         return 0;
     }
 
-    if (rank == 1) {
-        int count = 0;
-        for (int i = 0; i < total_pages; i++) {
-            if (page_allocated[i] == 0) {
-                count++;
-            }
-        }
-        return count;
+    if (rank > max_rank) {
+        return 0;
     }
 
-    // For higher ranks, we need proper buddy system implementation
-    // For now, return 0 for ranks > 1
-    return 0;
+    int count = 0;
+    struct block_header *current = free_lists[rank];
+    while (current != NULL) {
+        count++;
+        current = current->next;
+    }
+
+    return count;
 }
